@@ -65,6 +65,9 @@ namespace WorkBuddyDataMover
         private int _logLines;
         private const int LogMaxLines = 4000;
 
+        /// <summary>本次会话内上次选择归档位置的目录，方便连续归档。</summary>
+        private string _lastArchiveDir;
+
         public MainForm() : this(false) { }
 
         public MainForm(bool skipAutoLoad)
@@ -162,6 +165,9 @@ namespace WorkBuddyDataMover
             mTools.DropDownItems.Add(new ToolStripSeparator());
             mTools.DropDownItems.Add("查看迁移记录", null, (s, e) => ViewRecord());
             mTools.DropDownItems.Add("打开迁移记录所在文件夹", null, (s, e) => OpenRecordFolder());
+            mTools.DropDownItems.Add(new ToolStripSeparator());
+            mTools.DropDownItems.Add("归档备份为压缩包…", null, async (s, e) => await ArchiveBackupAsync());
+            mTools.DropDownItems.Add("搬回默认位置（撤销迁移）…", null, async (s, e) => await RestoreAsync());
             mTools.DropDownItems.Add(new ToolStripSeparator());
             mTools.DropDownItems.Add("清理备份目录…", null, async (s, e) => await CleanupAsync());
 
@@ -929,10 +935,15 @@ namespace WorkBuddyDataMover
         private void UpdateRollbackAvailability()
         {
             MigrationRecord rec = MigrationRecord.Load();
-            bool can = rec != null && rec.IsCompleted;
+
+            // restore 记录不是"迁移"，没有可回滚的备份目录，不能让它把回滚/清理按钮点亮
+            bool can = rec != null && rec.IsCompleted && !IsRestoreRecord(rec);
             if (_btnRollback != null) _btnRollback.Enabled = can && !_busy;
             if (_btnCleanup != null) _btnCleanup.Enabled = can && !_busy;
         }
+
+        private static bool IsRestoreRecord(MigrationRecord rec)
+            => rec != null && string.Equals(rec.Mode, "restore", StringComparison.OrdinalIgnoreCase);
 
         // ======================= 清单交互 =======================
 
@@ -1269,6 +1280,15 @@ namespace WorkBuddyDataMover
                 return;
             }
 
+            if (IsRestoreRecord(rec))
+            {
+                MessageBox.Show(this,
+                    "当前记录是「搬回默认位置」的结果，没有可回滚的备份目录。\r\n\r\n" +
+                    "数据现在已经回到原位置，原盘那份仍完整保留，无需回滚。",
+                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
             var sb = new System.Text.StringBuilder();
             sb.AppendLine("将把以下迁移完整还原：");
             sb.AppendLine();
@@ -1401,6 +1421,369 @@ namespace WorkBuddyDataMover
             }
         }
 
+        // ======================= 归档备份 =======================
+
+        private async Task ArchiveBackupAsync()
+        {
+            if (_busy) return;
+
+            MigrationRecord rec = MigrationRecord.Load();
+            if (rec == null || !rec.IsCompleted)
+            {
+                MessageBox.Show(this, "没有可归档的备份（或已完成回滚/清理）。", "提示",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (IsRestoreRecord(rec))
+            {
+                MessageBox.Show(this, "当前记录是「搬回默认位置」的结果，没有备份目录可归档。", "提示",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var backups = new List<string>();
+            if (!string.IsNullOrEmpty(rec.BackupPath)) backups.Add(rec.BackupPath);
+            foreach (PartialItemRecord it in rec.Items)
+                if (!string.IsNullOrEmpty(it.BackupPath)) backups.Add(it.BackupPath);
+
+            backups = backups.Where(p => Directory.Exists(LongPath.Fix(p))).ToList();
+            if (backups.Count == 0)
+            {
+                MessageBox.Show(this, "备份目录已不存在，可能已被清理。", "提示",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            // 让用户选保存位置
+            string sevenZip = ArchiveEngine.FindSevenZip();
+            string suggestedName = Path.GetFileName(LongPath.Normalize(backups[0]))
+                                   + (sevenZip != null ? ".7z" : ".zip");
+
+            string suggestedDir = _lastArchiveDir;
+            if (string.IsNullOrEmpty(suggestedDir) || !Directory.Exists(suggestedDir))
+            {
+                // 默认建议放在"与数据不在同一块盘"的盘上，其次是文档目录
+                suggestedDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "WorkBuddyBackup");
+            }
+
+            string archivePath;
+            using (var dlg = new SaveFileDialog())
+            {
+                dlg.Title = "选择压缩包保存位置";
+                dlg.Filter = sevenZip != null
+                    ? "7z 压缩包 (*.7z)|*.7z|Zip 压缩包 (*.zip)|*.zip"
+                    : "Zip 压缩包 (*.zip)|*.zip";
+                dlg.FileName = suggestedName;
+                dlg.InitialDirectory = suggestedDir;
+                dlg.OverwritePrompt = true;
+                dlg.AddExtension = true;
+
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                archivePath = dlg.FileName;
+            }
+
+            _lastArchiveDir = Path.GetDirectoryName(archivePath) ?? _lastArchiveDir;
+
+            // 目标盘空间粗算：压缩后按源的 70% 估计
+            long srcBytes = 0;
+            foreach (string b in backups)
+                srcBytes += ProcessGuard.MeasureDirectory(b).Bytes;
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("即将把备份目录压缩归档：");
+            sb.AppendLine();
+            foreach (string b in backups) sb.AppendLine("· " + b);
+            sb.AppendLine();
+            sb.AppendLine($"源大小：{Fmt.Bytes(srcBytes)}（{backups.Count} 个目录）");
+            sb.AppendLine($"保存到：{archivePath}");
+            sb.AppendLine($"压缩引擎：{(sevenZip != null ? "7-Zip（LZMA2，标准压缩）" : "内置 Zip（未检测到 7-Zip）")}");
+            sb.AppendLine();
+            sb.AppendLine("压缩完成后会自动校验压缩包完整性，");
+            sb.AppendLine("校验通过后才会询问是否删除原备份目录。");
+
+            if (MessageBox.Show(this, sb.ToString(), "确认归档", MessageBoxButtons.OKCancel,
+                    MessageBoxIcon.Question) != DialogResult.OK)
+                return;
+
+            SetBusy(true);
+            _cancelRequested = false;
+            _bar.Style = ProgressBarStyle.Continuous;
+            _bar.Value = 0;
+
+            bool refreshAfter = false;
+
+            try
+            {
+                var created = new List<ArchiveResult>();
+
+                for (int i = 0; i < backups.Count; i++)
+                {
+                    string src = backups[i];
+                    string dst = archivePath;
+
+                    // 多个备份目录时，各自生成一个包
+                    if (backups.Count > 1)
+                    {
+                        string dir = Path.GetDirectoryName(archivePath) ?? ".";
+                        string ext = Path.GetExtension(archivePath);
+                        string baseName = Path.GetFileNameWithoutExtension(archivePath);
+                        dst = Path.Combine(dir, baseName + "-" + (i + 1) + ext);
+                    }
+
+                    int index = i;
+                    int count = backups.Count;
+
+                    ArchiveResult ar = await Task.Run(() => ArchiveEngine.Create(
+                        src, dst,
+                        (pct, msg) =>
+                        {
+                            try
+                            {
+                                BeginInvoke(new Action(() =>
+                                {
+                                    _bar.Value = Math.Max(0, Math.Min(100, pct));
+                                    _lblProgress.Text = count > 1
+                                        ? $"[{index + 1}/{count}] {msg}"
+                                        : msg;
+                                }));
+                            }
+                            catch { }
+                        },
+                        () => _cancelRequested));
+
+                    created.Add(ar);
+
+                    if (!ar.Success)
+                    {
+                        _lblProgress.Text = "归档失败";
+                        MessageBox.Show(this,
+                            "归档未完成：\r\n\r\n" + (ar.Error ?? "未知错误") +
+                            "\r\n\r\n原始备份目录未被改动。",
+                            "归档失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        return;
+                    }
+                }
+
+                _bar.Value = 100;
+
+                // 逐个校验
+                _lblProgress.Text = "正在校验压缩包…";
+                var bad = new List<string>();
+                foreach (ArchiveResult ar in created)
+                {
+                    bool ok = await Task.Run(() => ArchiveEngine.Verify(ar.ArchivePath, out _));
+                    if (!ok) bad.Add(ar.ArchivePath);
+                }
+
+                if (bad.Count > 0)
+                {
+                    _lblProgress.Text = "压缩包校验未通过";
+                    MessageBox.Show(this,
+                        "压缩包校验未通过，已中止，原备份目录未删除：\r\n\r\n" +
+                        string.Join("\r\n", bad),
+                        "校验失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                long totalArchive = created.Sum(a => a.ArchiveBytes);
+                var done = new System.Text.StringBuilder();
+                done.AppendLine("归档完成，压缩包已校验通过。");
+                done.AppendLine();
+                foreach (ArchiveResult ar in created)
+                {
+                    done.AppendLine($"· {ar.ArchivePath}");
+                    done.AppendLine($"  {Fmt.Bytes(ar.SourceBytes)} → {Fmt.Bytes(ar.ArchiveBytes)}" +
+                                    $"（压缩率 {ar.Ratio:P0}），{ar.SourceFiles} 个文件");
+                }
+                done.AppendLine();
+                done.AppendLine($"合计占用：{Fmt.Bytes(totalArchive)}");
+
+                Log(LogLevel.Ok, $"归档完成：{backups.Count} 个目录 → {created.Count} 个压缩包，" +
+                                 $"{Fmt.Bytes(srcBytes)} → {Fmt.Bytes(totalArchive)}");
+
+                MessageBox.Show(this, done.ToString(), "归档完成",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+                // 校验通过后才询问是否删除
+                var del = new System.Text.StringBuilder();
+                del.AppendLine("压缩包已校验通过。现在要删除原备份目录、释放源盘空间吗？");
+                del.AppendLine();
+                foreach (string b in backups) del.AppendLine("· " + b);
+                del.AppendLine();
+                del.AppendLine($"可释放约 {Fmt.Bytes(srcBytes)}。");
+                del.AppendLine();
+                del.AppendLine("删除后，工具里的「一键回滚」将失效（退路变成了这个压缩包）。");
+
+                if (MessageBox.Show(this, del.ToString(), "是否删除原备份", MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                {
+                    Log(LogLevel.Info, "已保留原备份目录。");
+                    refreshAfter = true;
+                    return;
+                }
+
+                _lblProgress.Text = "正在删除原备份…";
+                int removed = await Task.Run(() => MigrationEngine.CleanupBackups(rec, Log));
+                Log(LogLevel.Ok, $"已删除 {removed} 个备份目录，释放约 {Fmt.Bytes(srcBytes)}。");
+                _lblProgress.Text = $"已归档并清理 {removed} 个备份目录";
+
+                MessageBox.Show(this,
+                    $"已删除 {removed} 个备份目录，释放约 {Fmt.Bytes(srcBytes)}。\r\n\r\n" +
+                    "压缩包：" + string.Join("\r\n", created.Select(a => a.ArchivePath)),
+                    "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+                refreshAfter = true;
+            }
+            catch (Exception ex)
+            {
+                _lblProgress.Text = "归档异常";
+                Log(LogLevel.Error, "归档异常：" + ex.Message);
+                MessageBox.Show(this, "归档异常：" + ex.Message, "错误",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                _bar.Style = ProgressBarStyle.Continuous;
+                _bar.Value = 0;
+                SetBusy(false);
+                UpdateRollbackAvailability();
+                if (refreshAfter) await LoadSnapshotAsync();
+            }
+        }
+
+        // ======================= 搬回默认位置 =======================
+
+        private async Task RestoreAsync()
+        {
+            if (_busy) return;
+
+            SetBusy(true, cancelable: false);
+            _bar.Style = ProgressBarStyle.Marquee;
+            _lblProgress.Text = "正在检查能否搬回…";
+
+            RestorePreflight pf;
+            try
+            {
+                pf = await Task.Run(() => RestoreEngine.Preflight(null, null, false, Log));
+            }
+            finally
+            {
+                _bar.Style = ProgressBarStyle.Continuous;
+                _bar.Value = 0;
+                SetBusy(false);
+            }
+
+            if (!pf.Passed)
+            {
+                var fails = pf.Failures.ToList();
+                _lblProgress.Text = "无法搬回";
+                MessageBox.Show(this,
+                    "搬回预检未通过：\r\n\r\n" +
+                    string.Join("\r\n\r\n", fails.Select(i => "· " + i.Name + "：" + i.Detail)),
+                    "无法搬回", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("即将把数据搬回默认位置：");
+            sb.AppendLine();
+            sb.AppendLine($"数据来源：{pf.DataDir}");
+            sb.AppendLine($"还原到：  {pf.RestoreDir}");
+            sb.AppendLine($"数据量：  {Fmt.Bytes(pf.RequiredBytes)} / {Fmt.Count(pf.RequiredFiles)} 个文件");
+            sb.AppendLine($"方式：    {(pf.Mode == RestoreMode.Junction ? "删除目录联接，改回实体目录" : "清空环境变量 " + pf.EnvName)}");
+            sb.AppendLine();
+            sb.AppendLine("执行顺序：");
+            sb.AppendLine("1. 复制到同盘中转目录 " + Path.GetFileName(pf.TempDir));
+            sb.AppendLine("2. 逐文件校验");
+            sb.AppendLine("3. 撤掉重定向（删联接 / 清环境变量）");
+            sb.AppendLine("4. 中转目录改名到正式位置（同卷原子操作）");
+            sb.AppendLine();
+            sb.AppendLine("前两步失败时现有配置完全不动；后两步失败会自动重建联接。");
+            sb.AppendLine();
+            sb.AppendLine("搬回后，原盘那份数据不会被删除，确认正常后由你自行处理。");
+            sb.AppendLine();
+            sb.AppendLine("· WorkBuddy 必须已完全退出。");
+
+            if (MessageBox.Show(this, sb.ToString(), "确认搬回",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                return;
+
+            SetBusy(true);
+            _cancelRequested = false;
+            _bar.Style = ProgressBarStyle.Continuous;
+            _bar.Value = 0;
+
+            bool refreshAfter = false;
+
+            try
+            {
+                RestoreResult res = await Task.Run(() => RestoreEngine.Execute(pf, Log,
+                    (pct, done, total) =>
+                    {
+                        try
+                        {
+                            BeginInvoke(new Action(() =>
+                            {
+                                _bar.Value = Math.Max(0, Math.Min(100, pct));
+                                _lblProgress.Text = $"{pct}%    {Fmt.Bytes(done)} / {Fmt.Bytes(total)}";
+                            }));
+                        }
+                        catch { }
+                    },
+                    () => _cancelRequested));
+
+                _bar.Value = res.Success ? 100 : 0;
+
+                if (res.Success)
+                {
+                    _lblProgress.Text = "已搬回默认位置";
+                    var ok = new System.Text.StringBuilder();
+                    ok.AppendLine("数据已搬回默认位置。");
+                    ok.AppendLine();
+                    ok.AppendLine($"位置：{pf.RestoreDir}");
+                    ok.AppendLine($"搬回：{Fmt.Count(res.Files)} 个文件，{Fmt.Bytes(res.Bytes)}");
+                    ok.AppendLine($"用时：{Fmt.Duration(res.Elapsed)}");
+                    ok.AppendLine();
+                    ok.AppendLine("原数据仍完整保留在：");
+                    ok.AppendLine("  " + res.DataDir);
+                    ok.AppendLine();
+                    ok.AppendLine("请先启动 WorkBuddy 确认一切正常，");
+                    ok.AppendLine("再自行决定是否删除上面那份数据。");
+                    if (!res.RecordSaved)
+                        ok.AppendLine("\r\n⚠ 记录写入失败：" + (res.RecordSaveError ?? "未知原因"));
+
+                    MessageBox.Show(this, ok.ToString(), "搬回完成",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    refreshAfter = true;
+                }
+                else
+                {
+                    _lblProgress.Text = "搬回失败";
+                    MessageBox.Show(this,
+                        "搬回未完成：\r\n\r\n" + (res.Error ?? "未知错误") +
+                        "\r\n\r\n数据没有被删除，请查看日志确认当前状态。",
+                        "搬回失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log(LogLevel.Error, "搬回异常：" + ex);
+                MessageBox.Show(this, "搬回异常：" + ex.Message, "错误",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                _bar.Style = ProgressBarStyle.Continuous;
+                _bar.Value = 0;
+                SetBusy(false);
+                UpdateRollbackAvailability();
+                if (refreshAfter) await LoadSnapshotAsync();
+            }
+        }
+
         // ======================= 自检 / 菜单动作 =======================
 
         private async Task RunSelfTestAsync()
@@ -1484,7 +1867,9 @@ namespace WorkBuddyDataMover
                 "     · 部分迁移 —— 只搬缓存和可重下的目录，核心数据留在 C 盘。\r\n" +
                 "4. 先点「仅预检」确认没有阻断项，再点「开始迁移」。\r\n" +
                 "5. 启动 WorkBuddy 确认一切正常后，再点「清理备份」释放空间。\r\n" +
-                "6. 出现问题点「一键回滚」，可完整还原。\r\n\r\n" +
+                "6. 出现问题点「一键回滚」，可完整还原。\r\n" +
+                "7. 想省空间又不想丢掉退路：「工具 → 归档备份为压缩包」，校验通过后再决定是否删原备份。\r\n" +
+                "8. 想彻底撤回原处：「工具 → 搬回默认位置」，中途失败会自动重建联接。\r\n\r\n" +
                 "安全设计\r\n" +
                 "────────────────────────\r\n" +
                 "· 迁移顺序固定：复制 → 逐文件校验 → 原目录改名 → 建联接 → 写回滚记录。\r\n" +
@@ -1528,9 +1913,10 @@ namespace WorkBuddyDataMover
         private void ShowAbout()
         {
             MessageBox.Show(this,
-                "WorkBuddy 数据目录迁移工具  v1.1\r\n\r\n" +
+                "WorkBuddy 数据目录迁移工具  v1.2\r\n\r\n" +
                 "把 .workbuddy 数据目录从 C 盘安全搬到其他盘（含移动硬盘）。\r\n" +
-                "带预检、带逐文件校验、带一键回滚，破坏性操作全部可逆。\r\n\r\n" +
+                "带预检、带逐文件校验、带一键回滚，破坏性操作全部可逆。\r\n" +
+                "支持把备份归档成压缩包，也支持把数据搬回默认位置。\r\n\r\n" +
                 "技术栈：.NET 6 + WinForms；目录联接通过 Win32 API 创建，不依赖 mklink。\r\n\r\n" +
                 "回滚记录：" + WorkBuddyPaths.LastRecordPath,
                 "关于", MessageBoxButtons.OK, MessageBoxIcon.Information);

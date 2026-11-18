@@ -936,7 +936,7 @@ namespace WorkBuddyDataMover.Core
                 }
 
                 log(LogLevel.Step, "删除备份目录：" + b);
-                DeleteDirectoryRecursive(b);
+                DeleteDirectoryForCleanup(b);
                 removed++;
                 log(LogLevel.Ok, "  已删除");
             }
@@ -997,8 +997,8 @@ namespace WorkBuddyDataMover.Core
             }
         }
 
-        /// <summary>递归删除（仅用于本工具自己生成、且经过校验的备份目录）。</summary>
-        private static void DeleteDirectoryRecursive(string dir)
+        /// <summary>递归删除（仅用于本工具自己生成、且经过校验的备份 / 中转目录）。</summary>
+        internal static void DeleteDirectoryForCleanup(string dir)
         {
             string root = LongPath.Fix(dir);
 

@@ -49,6 +49,8 @@ namespace WorkBuddyDataMover.Core
                 Case10(sandbox);
                 Case11(sandbox);
                 Case12(sandbox);
+                Case13(sandbox);
+                Case14(sandbox);
             }
             catch (Exception ex)
             {
@@ -860,6 +862,193 @@ namespace WorkBuddyDataMover.Core
             // 收尾：用内存里的记录直接回滚，不写盘
             try { MigrationEngine.Rollback(res.Record, (l, m) => { }, skipProcessCheck: true, persist: false); }
             catch { }
+        }
+
+        // ---------------- 用例 13：归档 ----------------
+
+        private static void Case13(string sandbox)
+        {
+            Group("用例 13：备份归档（压缩 → 校验 → 解压往返比对）");
+
+            string root = Path.Combine(sandbox, "case13");
+            string src = Path.Combine(root, "src");
+            Directory.CreateDirectory(LongPath.Fix(Path.Combine(src, "sub", "深层")));
+
+            var rnd = new Random(20261118);
+            var blob = new byte[200 * 1024];
+            rnd.NextBytes(blob);
+
+            // 混合内容：可压缩的文本 + 不可压缩的随机字节 + 中文名，用来验证压缩率和文件名保真
+            File.WriteAllText(LongPath.Fix(Path.Combine(src, "hello.txt")),
+                string.Concat(Enumerable.Repeat("WorkBuddy 数据目录迁移工具\n", 4000)), new UTF8Encoding(false));
+            File.WriteAllBytes(LongPath.Fix(Path.Combine(src, "random.bin")), blob);
+            File.WriteAllText(LongPath.Fix(Path.Combine(src, "sub", "深层", "中文 文件名.log")),
+                "日志内容", new UTF8Encoding(false));
+
+            string archivePath = Path.Combine(root, "out", "backup.7z");
+            string sevenZip = ArchiveEngine.FindSevenZip();
+            if (sevenZip == null) archivePath = Path.Combine(root, "out", "backup.zip");
+
+            ArchiveResult ar = ArchiveEngine.Create(src, archivePath);
+            Check("归档成功", ar.Success, ar.Error ?? "");
+            if (!ar.Success) return;
+
+            Check("压缩包已生成", File.Exists(LongPath.Fix(archivePath)), archivePath);
+            Check("统计到 3 个文件", ar.SourceFiles == 3, "实际 " + ar.SourceFiles);
+            Check("压缩包小于源目录（有压缩效果）", ar.ArchiveBytes > 0 && ar.ArchiveBytes < ar.SourceBytes,
+                $"{Fmt.Bytes(ar.SourceBytes)} → {Fmt.Bytes(ar.ArchiveBytes)}");
+
+            bool verified = ArchiveEngine.Verify(archivePath, out string vmsg);
+            Check("压缩包校验通过", verified, vmsg ?? "");
+
+            // 解压往返：文件名与内容必须一字不差
+            string extractTo = Path.Combine(root, "extract");
+            Directory.CreateDirectory(LongPath.Fix(extractTo));
+
+            bool extracted = true;
+            string exErr = null;
+            try
+            {
+                if (sevenZip != null)
+                {
+                    var psi = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = sevenZip,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                    };
+                    psi.ArgumentList.Add("x");
+                    psi.ArgumentList.Add("-y");
+                    psi.ArgumentList.Add("-o" + extractTo);
+                    psi.ArgumentList.Add(archivePath);
+                    using (var p = System.Diagnostics.Process.Start(psi))
+                    {
+                        p.WaitForExit(120000);
+                        if (p.ExitCode != 0) { extracted = false; exErr = "退出码 " + p.ExitCode; }
+                    }
+                }
+                else
+                {
+                    System.IO.Compression.ZipFile.ExtractToDirectory(
+                        LongPath.Fix(archivePath), LongPath.Fix(extractTo), Encoding.UTF8, true);
+                }
+            }
+            catch (Exception ex) { extracted = false; exErr = ex.Message; }
+
+            Check("压缩包可解压", extracted, exErr ?? "");
+            if (!extracted) return;
+
+            string unwrapped = Path.Combine(extractTo, "src");
+
+            Check("解压后目录结构保留（含顶层目录名）", Directory.Exists(LongPath.Fix(unwrapped)), unwrapped);
+            Check("文本文件内容一致",
+                File.Exists(LongPath.Fix(Path.Combine(unwrapped, "hello.txt"))) &&
+                File.ReadAllText(LongPath.Fix(Path.Combine(unwrapped, "hello.txt")), Encoding.UTF8)
+                    == string.Concat(Enumerable.Repeat("WorkBuddy 数据目录迁移工具\n", 4000)));
+            Check("二进制文件字节一致",
+                File.Exists(LongPath.Fix(Path.Combine(unwrapped, "random.bin"))) &&
+                File.ReadAllBytes(LongPath.Fix(Path.Combine(unwrapped, "random.bin"))).SequenceEqual(blob));
+            Check("中文与空格文件名保真",
+                File.Exists(LongPath.Fix(Path.Combine(unwrapped, "sub", "深层", "中文 文件名.log"))));
+
+            // 安全：不许覆盖已有压缩包
+            ArchiveResult dup = ArchiveEngine.Create(src, archivePath);
+            Check("目标压缩包已存在时拒绝覆盖", !dup.Success && (dup.Error ?? "").Contains("已存在"), dup.Error ?? "");
+
+            // 安全：不许把压缩包放进被压缩目录内部（否则会自己压自己）
+            ArchiveResult inside = ArchiveEngine.Create(src, Path.Combine(src, "self.7z"));
+            Check("拒绝把压缩包放进源目录内部",
+                !inside.Success && (inside.Error ?? "").Contains("不能放在"), inside.Error ?? "");
+            Check("被拒绝时未产生残余文件", !File.Exists(LongPath.Fix(Path.Combine(src, "self.7z"))));
+        }
+
+        // ---------------- 用例 14：搬回默认位置 ----------------
+
+        private static void Case14(string sandbox)
+        {
+            Group("用例 14：搬回默认位置（迁移 → 反向搬回 → 校验）");
+
+            string root = Path.Combine(sandbox, "case14");
+            string src = Path.Combine(root, "home", ".workbuddy");     // 假装是 %USERPROFILE%\.workbuddy
+            string dst = Path.Combine(root, "other-disk");
+
+            Directory.CreateDirectory(LongPath.Fix(Path.Combine(src, "logs")));
+            Directory.CreateDirectory(LongPath.Fix(Path.Combine(src, "projects")));
+            File.WriteAllText(LongPath.Fix(Path.Combine(src, "logs", "a.log")), "A", new UTF8Encoding(false));
+            File.WriteAllText(LongPath.Fix(Path.Combine(src, "projects", "p.json")), "{\"p\":1}", new UTF8Encoding(false));
+            File.WriteAllText(LongPath.Fix(Path.Combine(src, "workbuddy.db")), "DB", new UTF8Encoding(false));
+
+            string migRec = Path.Combine(root, "migrate.json");
+            string restRec = Path.Combine(root, "restore.json");
+
+            // 先正向迁移（整体，目录联接方式）
+            var opt = new MigrationOptions
+            {
+                SourcePath = src,
+                TargetRoot = dst,
+                Mode = MigrateMode.Junction,
+                SkipProcessCheck = true,
+                RecordPath = migRec,
+            };
+
+            MigrationResult mig = MigrationEngine.Execute(opt, (l, m) => { });
+            Check("前置：正向迁移成功", mig.Success, mig.Error ?? "");
+            if (!mig.Success) return;
+
+            string dataDir = Path.Combine(dst, ".workbuddy");
+            Check("前置：原位置已是联接", Junction.IsJunction(src));
+
+            // 反向预检：把 sandbox 里的 src 当作"默认位置"
+            RestorePreflight pf = RestoreEngine.Preflight(src, null, skipProcessCheck: true);
+            Check("反向预检通过", pf.Passed,
+                pf.Passed ? "" : string.Join("；", pf.Failures.Select(f => f.Name + "：" + f.Detail)));
+            Check("识别为目录联接模式", pf.Mode == RestoreMode.Junction, pf.Mode.ToString());
+            Check("数据来源推导正确（联接目标）",
+                LongPath.PathEquals(pf.DataDir, dataDir), pf.DataDir ?? "");
+            Check("中转目录与原位置同卷", pf.TempDir != null &&
+                string.Equals(Path.GetPathRoot(pf.TempDir), Path.GetPathRoot(src), StringComparison.OrdinalIgnoreCase),
+                pf.TempDir ?? "");
+
+            if (!pf.Passed) return;
+
+            string tempDir = pf.TempDir;
+
+            RestoreResult res = RestoreEngine.Execute(pf, (l, m) => { }, null, null, restRec);
+            Check("搬回成功", res.Success, res.Error ?? "");
+
+            if (res.Success)
+            {
+                Check("原位置变回实体目录（不再是联接）",
+                    LongPath.IsDirectory(src) && !Junction.IsJunction(src));
+                Check("数据完整回来（子目录 + 根散落文件）",
+                    File.Exists(LongPath.Fix(Path.Combine(src, "logs", "a.log"))) &&
+                    File.Exists(LongPath.Fix(Path.Combine(src, "projects", "p.json"))) &&
+                    File.Exists(LongPath.Fix(Path.Combine(src, "workbuddy.db"))));
+                Check("数据内容一致", File.ReadAllText(LongPath.Fix(Path.Combine(src, "workbuddy.db"))) == "DB");
+                Check("原盘那份数据保留未删", File.Exists(LongPath.Fix(Path.Combine(dataDir, "workbuddy.db"))));
+                Check("中转目录已消失（已改名为正式目录）", !LongPath.Exists(tempDir), tempDir);
+                Check("记录方式为 restore",
+                    (MigrationRecord.Load(restRec)?.Mode ?? "") == "restore",
+                    MigrationRecord.Load(restRec)?.Mode ?? "");
+                Check("记录里保留了数据原位置",
+                    LongPath.PathEquals(MigrationRecord.Load(restRec)?.TargetPath, dataDir));
+
+                // 再搬一次必须被拒绝
+                RestorePreflight again = RestoreEngine.Preflight(src, null, skipProcessCheck: true);
+                Check("已是实体目录时拒绝重复搬回",
+                    !again.Passed && again.Failures.Any(f => f.Detail.Contains("实体目录")),
+                    again.Passed ? "未拦截" : string.Join("；", again.Failures.Select(f => f.Detail)));
+
+                // 清理沙箱里的迁移备份，避免影响后续用例的目录大小统计
+                try
+                {
+                    MigrationRecord mrec = MigrationRecord.Load(migRec);
+                    MigrationEngine.CleanupBackups(mrec, (l, m) => { });
+                }
+                catch { }
+            }
         }
 
         // ---------------- 工具 ----------------

@@ -13,8 +13,8 @@
     <ApplicationIcon>app.ico</ApplicationIcon>
     <CodePage>65001</CodePage>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <Version>1.1.0</Version>
-    <FileVersion>1.1.0.0</FileVersion>
+    <Version>1.2.0</Version>
+    <FileVersion>1.2.0.0</FileVersion>
     <Product>WorkBuddy 数据目录迁移工具</Product>
     <AssemblyTitle>WorkBuddy 数据目录迁移工具</AssemblyTitle>
     <Company>WorkBuddyDataMover</Company>

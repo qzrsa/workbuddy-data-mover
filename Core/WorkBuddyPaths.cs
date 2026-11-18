@@ -278,6 +278,20 @@ namespace WorkBuddyDataMover.Core
             return ResolveConfigDir(out _);
         }
 
+        /// <summary>
+        /// 产品的默认数据目录 %USERPROFILE%\.workbuddy——不看任何环境变量。
+        /// 「搬回原处」要还原到的就是这里，所以必须与环境变量解析严格分开。
+        /// </summary>
+        public static string DefaultConfigDir
+        {
+            get
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    DefaultFolderName);
+            }
+        }
+
         public static string LastRecordPath
         {
             get
