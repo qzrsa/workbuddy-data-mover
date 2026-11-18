@@ -105,12 +105,16 @@ namespace WorkBuddyDataMover.Core
             return list.OrderBy(x => x.Id).ToList();
         }
 
-        /// <summary>用独占方式试探文件是否被占用。</summary>
+        /// <summary>
+        /// 用独占方式试探文件是否被占用。
+        /// 只用 Read 权限申请 FileShare.None：既能发现任何已打开该文件的句柄，
+        /// 又不会被"文件只读"这类属性误判成没被占用。
+        /// </summary>
         public static bool IsFileLocked(string filePath)
         {
             try
             {
-                using (new FileStream(LongPath.Fix(filePath), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                using (new FileStream(LongPath.Fix(filePath), FileMode.Open, FileAccess.Read, FileShare.None))
                     return false;
             }
             catch (FileNotFoundException) { return false; }

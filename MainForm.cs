@@ -59,6 +59,12 @@ namespace WorkBuddyDataMover
         private bool _suppressCheck;
         private bool _suppressDriveEvent;
 
+        // 日志用字体缓存：每行 new Font 会持续泄漏 GDI 句柄
+        private Font _logRegular;
+        private Font _logBold;
+        private int _logLines;
+        private const int LogMaxLines = 4000;
+
         public MainForm() : this(false) { }
 
         public MainForm(bool skipAutoLoad)
@@ -1185,7 +1191,17 @@ namespace WorkBuddyDataMover
                     sb.AppendLine("原数据已改名保留，并未删除。请先启动 WorkBuddy 确认一切正常，");
                     sb.AppendLine("再执行「清理备份」释放这部分空间。");
                     sb.AppendLine();
-                    sb.AppendLine("回滚记录：" + WorkBuddyPaths.LastRecordPath);
+
+                    if (res.RecordSaved)
+                    {
+                        sb.AppendLine("回滚记录：" + WorkBuddyPaths.LastRecordPath);
+                    }
+                    else
+                    {
+                        sb.AppendLine("⚠ 回滚记录写入失败：" + (res.RecordSaveError ?? "未知原因"));
+                        sb.AppendLine("迁移本身已完成，但工具记不住还原信息。请手动抄下这些备份目录：");
+                        foreach (string b in res.BackupPaths) sb.AppendLine("  · " + b);
+                    }
 
                     MessageBox.Show(this, sb.ToString(), "迁移完成",
                         MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1471,14 +1487,17 @@ namespace WorkBuddyDataMover
                 "6. 出现问题点「一键回滚」，可完整还原。\r\n\r\n" +
                 "安全设计\r\n" +
                 "────────────────────────\r\n" +
-                "· 迁移顺序固定：复制 → 逐目录校验 → 原目录改名 → 建联接 → 写回滚记录。\r\n" +
+                "· 迁移顺序固定：复制 → 逐文件校验 → 原目录改名 → 建联接 → 写回滚记录。\r\n" +
                 "· 原目录只会被改名成 .moved-<时间>，工具从不自动删除。\r\n" +
                 "· 第 4 步失败会自动把原名改回去。\r\n" +
+                "· 源目录里有读不到的地方会当场中止（此时还没动目标、也没动源）。\r\n" +
                 "· 移除联接走 RemoveDirectory，并在删除前校验它确实是联接。\r\n" +
                 "· 全程使用 \\\\?\\ 长路径，跳过重解析点，不依赖注册表长路径开关。\r\n\r\n" +
                 "限制\r\n" +
                 "────────────────────────\r\n" +
                 "· 目标盘符必须固定，移动硬盘盘符漂移会导致联接失效。\r\n" +
+                "· 源目录内部已有的联接不会被复制，日志会列出这些路径。\r\n" +
+                "· 不保留 NTFS 权限与「来自 Internet」标记。\r\n" +
                 "· 不支持多台电脑共用同一数据目录（凭据、device-id、数据库都会冲突）。\r\n" +
                 "· 「工具 → 运行环境自检」只在临时沙箱里跑，不碰真实数据。";
 
@@ -1509,9 +1528,9 @@ namespace WorkBuddyDataMover
         private void ShowAbout()
         {
             MessageBox.Show(this,
-                "WorkBuddy 数据目录迁移工具  v1.0\r\n\r\n" +
+                "WorkBuddy 数据目录迁移工具  v1.1\r\n\r\n" +
                 "把 .workbuddy 数据目录从 C 盘安全搬到其他盘（含移动硬盘）。\r\n" +
-                "带预检、带逐字节校验、带一键回滚，破坏性操作全部可逆。\r\n\r\n" +
+                "带预检、带逐文件校验、带一键回滚，破坏性操作全部可逆。\r\n\r\n" +
                 "技术栈：.NET 6 + WinForms；目录联接通过 Win32 API 创建，不依赖 mklink。\r\n\r\n" +
                 "回滚记录：" + WorkBuddyPaths.LastRecordPath,
                 "关于", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1584,15 +1603,29 @@ namespace WorkBuddyDataMover
             string prefix = level == LogLevel.Step ? "" : "  ";
             string line = prefix + message;
 
+            // 日志只增不减会拖慢界面，超过上限时整体截断（迁移关键信息都在最近的行里）
+            if (_logLines >= LogMaxLines)
+            {
+                _log.Clear();
+                _logLines = 0;
+                _log.SelectionColor = Color.FromArgb(120, 120, 120);
+                _log.AppendText("……（日志过长，前面的内容已截断）" + Environment.NewLine);
+            }
+
+            if (_logRegular == null || _logBold == null)
+            {
+                _logRegular = new Font(_log.Font, FontStyle.Regular);
+                _logBold = new Font(_log.Font, FontStyle.Bold);
+            }
+
             _log.SelectionStart = _log.TextLength;
             _log.SelectionLength = 0;
             _log.SelectionColor = color;
-
-            if (level == LogLevel.Step)
-                _log.SelectionFont = new Font(_log.Font, FontStyle.Bold);
+            _log.SelectionFont = level == LogLevel.Step ? _logBold : _logRegular;
 
             _log.AppendText(line + Environment.NewLine);
-            _log.SelectionFont = new Font(_log.Font, FontStyle.Regular);
+            _logLines++;
+
             _log.SelectionColor = _log.ForeColor;
             _log.ScrollToCaret();
         }
@@ -1613,6 +1646,13 @@ namespace WorkBuddyDataMover
             }
 
             base.OnFormClosing(e);
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            try { _logRegular?.Dispose(); } catch { }
+            try { _logBold?.Dispose(); } catch { }
+            base.OnFormClosed(e);
         }
     }
 }

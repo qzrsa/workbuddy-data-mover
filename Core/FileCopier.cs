@@ -21,6 +21,10 @@ namespace WorkBuddyDataMover.Core
         public int FileCount { get; set; }
         public int DirCount { get; set; }
         public int SkippedReparse { get; set; }
+
+        /// <summary>被跳过的重解析点（联接 / 符号链接）路径，用于在日志里明确告知。</summary>
+        public List<string> ReparsePaths { get; set; } = new List<string>();
+
         public List<string> ErrorMessages { get; set; } = new List<string>();
     }
 
@@ -82,6 +86,7 @@ namespace WorkBuddyDataMover.Core
                     if ((attr & FileAttributes.ReparsePoint) != 0)
                     {
                         result.SkippedReparse++;
+                        result.ReparsePaths.Add(childRel);
                         continue;
                     }
 
@@ -200,11 +205,35 @@ namespace WorkBuddyDataMover.Core
         }
 
         /// <summary>
-        /// 严格校验：文件数 + 总字节 必须完全相等。
+        /// 扫描只要有一条读取错误就拒绝继续。
+        /// 读不到的目录里的文件既不会进清单也不会被复制，目标端同样看不到，
+        /// 只比"总数"会得到一次假通过——那等于静默漏拷，是迁移工具最不能出现的后果。
+        /// </summary>
+        public static void ThrowIfScanFailed(ScanResult scan, string what)
+        {
+            if (scan == null) throw new ArgumentNullException(nameof(scan));
+            if (scan.ErrorMessages.Count == 0) return;
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"{what}有 {scan.ErrorMessages.Count} 处无法读取，为避免漏拷已中止（源数据未改动）。");
+            foreach (string m in scan.ErrorMessages.Take(8)) sb.AppendLine("  · " + m);
+            if (scan.ErrorMessages.Count > 8)
+                sb.AppendLine("  · …… 其余 " + (scan.ErrorMessages.Count - 8) + " 处省略");
+            sb.Append("请关闭占用这些位置的程序后重试；若确认这些位置无需迁移，请改用「部分迁移」避开对应子目录。");
+            throw new IOException(sb.ToString());
+        }
+
+        /// <summary>
+        /// 严格校验：文件数 + 总字节 必须完全相等，且逐个文件比对存在性与长度。
+        /// 只比总量是不够的：两个文件一长一短可以互相抵消，总量照样相等。
         /// </summary>
         public static void VerifyStrict(string targetRoot, ScanResult sourceScan)
         {
             var targetScan = Scan(targetRoot);
+
+            if (targetScan.ErrorMessages.Count > 0)
+                throw new IOException(
+                    $"校验失败：目标目录有 {targetScan.ErrorMessages.Count} 处无法读取，无法确认复制完整。已中止，源数据未改动。");
 
             if (targetScan.FileCount != sourceScan.FileCount)
                 throw new IOException(
@@ -213,6 +242,43 @@ namespace WorkBuddyDataMover.Core
             if (targetScan.TotalBytes != sourceScan.TotalBytes)
                 throw new IOException(
                     $"校验失败：总字节不一致（源 {sourceScan.TotalBytes}，目标 {targetScan.TotalBytes}）。已中止，源数据未改动。");
+
+            // 逐文件比对：目标里每个源文件都必须存在，且长度一致
+            var targetFiles = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            var targetDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (FileEntry e in targetScan.Entries)
+            {
+                if (e.IsDir) targetDirs.Add(e.RelPath);
+                else targetFiles[e.RelPath] = e.Length;
+            }
+
+            var failures = new List<string>();
+            foreach (FileEntry e in sourceScan.Entries)
+            {
+                if (e.IsDir)
+                {
+                    if (!targetDirs.Contains(e.RelPath)) failures.Add("目标缺少目录：" + e.RelPath);
+                    continue;
+                }
+
+                if (!targetFiles.TryGetValue(e.RelPath, out long len))
+                {
+                    failures.Add("目标缺少文件：" + e.RelPath);
+                    continue;
+                }
+
+                if (len != e.Length)
+                    failures.Add($"长度不一致：{e.RelPath}（源 {e.Length} 字节，目标 {len} 字节）");
+            }
+
+            if (failures.Count > 0)
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine($"校验失败：{failures.Count} 个条目与源不一致。已中止，源数据未改动。");
+                foreach (string f in failures.Take(10)) sb.AppendLine("  · " + f);
+                if (failures.Count > 10) sb.AppendLine("  · …… 其余 " + (failures.Count - 10) + " 项省略");
+                throw new IOException(sb.ToString());
+            }
         }
 
         /// <summary>
@@ -263,6 +329,10 @@ namespace WorkBuddyDataMover.Core
 
             // 目标独有的文件（合并模式合法）
             ScanResult targetScan = Scan(targetRoot);
+            if (targetScan.ErrorMessages.Count > 0)
+                throw new IOException(
+                    $"校验失败：目标目录有 {targetScan.ErrorMessages.Count} 处无法读取，无法确认复制完整。已中止，源数据未改动。");
+
             int targetOnly = 0;
             foreach (FileEntry e in targetScan.Entries)
             {

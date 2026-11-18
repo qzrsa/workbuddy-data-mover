@@ -44,6 +44,11 @@ namespace WorkBuddyDataMover.Core
                 Case4EnvVar(sandbox);
                 Case6(sandbox);
                 Case7(sandbox);
+                Case8(sandbox);
+                Case9(sandbox);
+                Case10(sandbox);
+                Case11(sandbox);
+                Case12(sandbox);
             }
             catch (Exception ex)
             {
@@ -265,6 +270,9 @@ namespace WorkBuddyDataMover.Core
             ScanResult scan = FileCopier.Scan(deep);
             Check("扫描跳过重解析点", scan.SkippedReparse >= 1, "跳过 " + scan.SkippedReparse + " 个");
             Check("扫描文件数 = 2（未把联接内容算进来）", scan.FileCount == 2, "实际 " + scan.FileCount);
+            Check("被跳过的联接连同相对路径一起留痕（可告知用户）",
+                scan.ReparsePaths.Any(p => p.EndsWith("linked", StringComparison.OrdinalIgnoreCase)),
+                string.Join("、", scan.ReparsePaths));
 
             string target = Path.Combine(root, "copy-target");
             CopyStats stats = FileCopier.Copy(deep, target, scan, false);
@@ -649,6 +657,209 @@ namespace WorkBuddyDataMover.Core
             Check("幂等性：重跑复制 0 个文件", again.FilesCopied == 0, "实际 " + again.FilesCopied);
             Check("幂等性：重跑 ScanPending 归零", again.ScanPending == 0, "实际 " + again.ScanPending);
             Check("幂等性：重跑后文件内容不变", ReadTxt("a.txt") == "AAA-newer" && ReadTxt("b.txt") == "BBB");
+        }
+
+        // ---------------- 用例 8：扫描错误必须阻断 ----------------
+
+        private static void Case8(string sandbox)
+        {
+            Group("用例 8：读不到的目录必须阻断迁移（否则会静默漏拷却报「校验通过」）");
+
+            string root = Path.Combine(sandbox, "case8");
+            Directory.CreateDirectory(LongPath.Fix(root));
+
+            // 干净目录不得被误杀
+            string clean = Path.Combine(root, "clean");
+            Directory.CreateDirectory(LongPath.Fix(clean));
+            File.WriteAllText(LongPath.Fix(Path.Combine(clean, "a.txt")), "ok", new UTF8Encoding(false));
+
+            ScanResult cleanScan = FileCopier.Scan(clean);
+            bool cleanThrew = false;
+            try { FileCopier.ThrowIfScanFailed(cleanScan, "测试目录"); }
+            catch { cleanThrew = true; }
+            Check("扫描无错误时不误报", !cleanThrew && cleanScan.ErrorMessages.Count == 0);
+
+            // 不存在的目录 → Scan 记错误 → 必须被拦下
+            string ghost = Path.Combine(root, "path-that-does-not-exist");
+            ScanResult bad = FileCopier.Scan(ghost);
+            Check("不存在的目录产生扫描错误", bad.ErrorMessages.Count > 0, "错误数 " + bad.ErrorMessages.Count);
+
+            bool threw = false;
+            string msg = "";
+            try { FileCopier.ThrowIfScanFailed(bad, "源目录"); }
+            catch (IOException ex) { threw = true; msg = ex.Message; }
+            catch (Exception ex) { msg = ex.GetType().Name + "：" + ex.Message; }
+
+            Check("扫描有错误时抛异常阻断", threw, msg);
+            Check("阻断信息说清了「已中止、源数据未改动」",
+                msg.Contains("已中止") && msg.Contains("无法读取"), msg.Split('\n').FirstOrDefault() ?? "");
+        }
+
+        // ---------------- 用例 9：盘根目标路径 ----------------
+
+        private static void Case9(string sandbox)
+        {
+            Group("用例 9：目标位置填盘根时的路径推导（防止拼成 D 盘的相对路径）");
+
+            string driveRoot = Path.GetPathRoot(LongPath.Normalize(sandbox)) ?? @"C:\";
+            string letter = driveRoot.TrimEnd('\\');   // "C:"
+
+            string fromRoot = MigrationEngine.ResolveTargetDir(@"C:\Users\someone\.workbuddy", driveRoot);
+            Check($"盘根「{driveRoot}」→ {letter}\\.workbuddy",
+                string.Equals(fromRoot, letter + @"\.workbuddy", StringComparison.OrdinalIgnoreCase), fromRoot);
+
+            string fromBare = MigrationEngine.ResolveTargetDir(@"C:\Users\someone\.workbuddy", letter);
+            Check($"盘根「{letter}」（无尾分隔符）推导一致",
+                string.Equals(fromBare, letter + @"\.workbuddy", StringComparison.OrdinalIgnoreCase), fromBare);
+            Check("推导结果不是盘符相对路径（不以「盘符:」紧跟名字结尾）",
+                !fromBare.StartsWith(letter + ".", StringComparison.OrdinalIgnoreCase), fromBare);
+
+            string normal = MigrationEngine.ResolveTargetDir(@"C:\Users\someone\.workbuddy", @"D:\WorkBuddyData\");
+            Check("普通目录仍正确追加叶子名",
+                string.Equals(normal, @"D:\WorkBuddyData\.workbuddy", StringComparison.OrdinalIgnoreCase), normal);
+        }
+
+        // ---------------- 用例 10：逐文件校验 ----------------
+
+        private static void Case10(string sandbox)
+        {
+            Group("用例 10：严格校验必须逐文件比对（总量相同不等于复制完整）");
+
+            string root = Path.Combine(sandbox, "case10");
+            string src = Path.Combine(root, "src");
+            string dst = Path.Combine(root, "dst");
+            Directory.CreateDirectory(LongPath.Fix(src));
+
+            File.WriteAllText(LongPath.Fix(Path.Combine(src, "a.bin")), new string('A', 1000), new UTF8Encoding(false));
+            File.WriteAllText(LongPath.Fix(Path.Combine(src, "b.bin")), new string('B', 1000), new UTF8Encoding(false));
+
+            ScanResult scan = FileCopier.Scan(src);
+            FileCopier.Copy(src, dst, scan, false);
+
+            bool okClean = true;
+            try { FileCopier.VerifyStrict(dst, scan); } catch { okClean = false; }
+            Check("正常复制后校验通过", okClean);
+
+            // 一长一短：文件数与总字节都不变，只有逐文件比对才能发现
+            File.WriteAllText(LongPath.Fix(Path.Combine(dst, "a.bin")), new string('A', 900), new UTF8Encoding(false));
+            File.WriteAllText(LongPath.Fix(Path.Combine(dst, "b.bin")), new string('B', 1100), new UTF8Encoding(false));
+
+            ScanResult tampered = FileCopier.Scan(dst);
+            Check("篡改后文件数仍相同（总数校验会漏判）", tampered.FileCount == scan.FileCount,
+                $"源 {scan.FileCount} / 目标 {tampered.FileCount}");
+            Check("篡改后总字节仍相同（总数校验会漏判）", tampered.TotalBytes == scan.TotalBytes,
+                $"源 {scan.TotalBytes} / 目标 {tampered.TotalBytes}");
+
+            bool caught = false;
+            string msg = "";
+            try { FileCopier.VerifyStrict(dst, scan); }
+            catch (IOException ex) { caught = true; msg = ex.Message; }
+
+            Check("逐文件校验发现了长度不一致", caught, msg.Split('\n').FirstOrDefault() ?? "");
+            Check("报告指出了具体文件", msg.Contains("a.bin") || msg.Contains("b.bin"));
+        }
+
+        // ---------------- 用例 11：回滚失败不得假装成功 ----------------
+
+        private static void Case11(string sandbox)
+        {
+            Group("用例 11：回滚受阻时必须如实报错，且不把记录标成已回滚");
+
+            string root = Path.Combine(sandbox, "case11");
+            string src = Path.Combine(root, "src", ".workbuddy");
+            string dst = Path.Combine(root, "dst");
+            Directory.CreateDirectory(LongPath.Fix(Path.Combine(src, "logs")));
+            File.WriteAllText(LongPath.Fix(Path.Combine(src, "logs", "a.log")), "A", new UTF8Encoding(false));
+
+            string recPath = Path.Combine(root, "record.json");
+            var opt = new MigrationOptions
+            {
+                SourcePath = src,
+                TargetRoot = dst,
+                Mode = MigrateMode.Partial,
+                PartialNames = new List<string> { "logs" },
+                SkipProcessCheck = true,
+                RecordPath = recPath,
+                RequiredBytes = 1,
+            };
+
+            MigrationResult res = MigrationEngine.Execute(opt, (l, m) => { });
+            Check("前置：部分迁移成功", res.Success, res.Error ?? "");
+            if (!res.Success) return;
+
+            string srcLogs = Path.Combine(src, "logs");
+            string backup = res.BackupPaths.FirstOrDefault();
+
+            // 模拟「原位置被别的东西占用了」：拆掉联接，另建一个含数据的真实目录
+            try { Junction.Delete(srcLogs); } catch { }
+            Directory.CreateDirectory(LongPath.Fix(srcLogs));
+            File.WriteAllText(LongPath.Fix(Path.Combine(srcLogs, "someone-else.txt")), "别人的数据", new UTF8Encoding(false));
+
+            MigrationRecord rec = MigrationRecord.Load(recPath);
+            bool threw = false;
+            string msg = "";
+            try { MigrationEngine.Rollback(rec, (l, m) => { }, skipProcessCheck: true); }
+            catch (InvalidOperationException ex) { threw = true; msg = ex.Message; }
+            catch (Exception ex) { msg = ex.GetType().Name + "：" + ex.Message; }
+
+            Check("回滚受阻时抛出异常而不是静默成功", threw, msg);
+            Check("别人的数据没有被删", File.Exists(LongPath.Fix(Path.Combine(srcLogs, "someone-else.txt"))));
+            Check("备份目录仍在（退路没丢）", backup != null && Directory.Exists(LongPath.Fix(backup)));
+            Check("记录仍为 completed（还能再次回滚）",
+                (MigrationRecord.Load(recPath)?.Status ?? "") != "rolledback",
+                MigrationRecord.Load(recPath)?.Status ?? "读取失败");
+
+            // 清理占用后再回滚，应当成功
+            try { TryDeleteTree(srcLogs); } catch { }
+            bool second = true;
+            msg = "";
+            try { MigrationEngine.Rollback(MigrationRecord.Load(recPath), (l, m) => { }, skipProcessCheck: true); }
+            catch (Exception ex) { second = false; msg = ex.Message; }
+
+            Check("占用消除后重新回滚成功", second, msg);
+            Check("重新回滚后记录为 rolledback",
+                (MigrationRecord.Load(recPath)?.Status ?? "") == "rolledback",
+                MigrationRecord.Load(recPath)?.Status ?? "");
+            Check("重新回滚后源文件回来了", File.Exists(LongPath.Fix(Path.Combine(srcLogs, "a.log"))));
+        }
+
+        // ---------------- 用例 12：记账失败不得回滚 ----------------
+
+        private static void Case12(string sandbox)
+        {
+            Group("用例 12：回滚记录写入失败时，迁移成果必须保留（不能因为记账失败就回滚）");
+
+            string root = Path.Combine(sandbox, "case12");
+            string src = Path.Combine(root, "src", ".workbuddy");
+            string dst = Path.Combine(root, "dst");
+            Directory.CreateDirectory(LongPath.Fix(Path.Combine(src, "projects")));
+            File.WriteAllText(LongPath.Fix(Path.Combine(src, "projects", "p.json")), "P", new UTF8Encoding(false));
+
+            // 把记录路径指到一个"目录"上，写文件必然失败
+            string badRecordPath = Path.Combine(root, "record-is-a-directory");
+            Directory.CreateDirectory(LongPath.Fix(badRecordPath));
+
+            var opt = new MigrationOptions
+            {
+                SourcePath = src,
+                TargetRoot = dst,
+                Mode = MigrateMode.Junction,
+                SkipProcessCheck = true,
+                RecordPath = badRecordPath,
+            };
+
+            MigrationResult res = MigrationEngine.Execute(opt, (l, m) => { });
+            Check("记账失败时迁移仍判定为成功", res.Success, res.Error ?? "");
+            Check("结果里标出了记录未落盘", !res.RecordSaved, res.RecordSaveError ?? "");
+            Check("联接仍然建立（成果保留）", Junction.IsJunction(src));
+            Check("数据仍可经联接读取", File.Exists(LongPath.Fix(Path.Combine(src, "projects", "p.json"))));
+            Check("备份目录仍在，可据此手工还原",
+                res.Record?.BackupPath != null && Directory.Exists(LongPath.Fix(res.Record.BackupPath)),
+                res.Record?.BackupPath ?? "");
+
+            // 收尾：用内存里的记录直接回滚，不写盘
+            try { MigrationEngine.Rollback(res.Record, (l, m) => { }, skipProcessCheck: true, persist: false); }
+            catch { }
         }
 
         // ---------------- 工具 ----------------

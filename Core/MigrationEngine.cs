@@ -70,6 +70,10 @@ namespace WorkBuddyDataMover.Core
         public long Bytes { get; set; }
         public int Files { get; set; }
         public TimeSpan Elapsed { get; set; }
+
+        /// <summary>回滚记录是否成功落盘。写入失败不代表迁移失败，但用户必须自己记下备份路径。</summary>
+        public bool RecordSaved { get; set; } = true;
+        public string RecordSaveError { get; set; }
     }
 
     public static class MigrationEngine
@@ -82,7 +86,15 @@ namespace WorkBuddyDataMover.Core
         {
             string leaf = Path.GetFileName(LongPath.Normalize(sourcePath));
             if (string.IsNullOrEmpty(leaf)) leaf = WorkBuddyPaths.DefaultFolderName;
-            return Path.Combine(LongPath.Unfix(targetRoot).TrimEnd('\\'), leaf);
+
+            string root = LongPath.Unfix(targetRoot ?? "").TrimEnd('\\', '/');
+
+            // "D:" 是"盘符相对路径"，直接 Path.Combine("D:", "x") 会得到 "D:x"，
+            // 再 GetFullPath 就跑到 D 盘的当前目录里去了。补回根分隔符。
+            if (root.Length == 2 && root[1] == ':') root += "\\";
+            if (root.Length == 0) throw new ArgumentException("目标位置为空。");
+
+            return Path.Combine(root, leaf);
         }
 
         // ---------------- 预检 ----------------
@@ -206,6 +218,20 @@ namespace WorkBuddyDataMover.Core
             // 5) 目标非空
             bool targetExists = LongPath.IsDirectory(targetDir);
             bool targetNonEmpty = targetExists && HasAnyEntry(targetDir);
+
+            if (LongPath.Exists(targetDir) && !targetExists)
+            {
+                Add("目标目录状态", false, "目标位置已存在一个同名文件，无法作为目录使用：" + targetDir + "。请换一个位置。");
+                return result;
+            }
+
+            if (string.Equals(Path.GetDirectoryName(LongPath.Normalize(targetDir)),
+                    LongPath.Normalize(Path.GetPathRoot(targetDir) ?? ""),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                Add("目标目录位置", true,
+                    "目标目录将直接落在盘根：" + targetDir + "。可以继续，但建议放到专用子目录里，便于以后整体搬走。", false);
+            }
 
             if (opt.Mode == MigrateMode.Partial)
             {
@@ -418,7 +444,21 @@ namespace WorkBuddyDataMover.Core
                 if (cancelled != null && cancelled())
                     throw new OperationCanceledException("操作已取消。");
 
-                record.Save(opt.RecordPath);
+                // 记账失败不等于迁移失败：这里已经不写源目录了，绝不能再把刚搬好的数据回滚掉。
+                try
+                {
+                    record.Save(opt.RecordPath);
+                }
+                catch (Exception sex)
+                {
+                    result.RecordSaved = false;
+                    result.RecordSaveError = sex.Message;
+                    log(LogLevel.Error, "迁移已完成，但回滚记录写入失败：" + sex.Message);
+                    log(LogLevel.Warn, "  请手动抄下下面的备份目录，将来需要还原时靠它们：");
+                    if (!string.IsNullOrEmpty(record.BackupPath)) log(LogLevel.Warn, "    · " + record.BackupPath);
+                    foreach (PartialItemRecord it in record.Items)
+                        if (!string.IsNullOrEmpty(it.BackupPath)) log(LogLevel.Warn, "    · " + it.BackupPath);
+                }
 
                 result.Success = true;
                 result.Bytes = record.MigratedBytes;
@@ -498,8 +538,21 @@ namespace WorkBuddyDataMover.Core
             // 1) 扫描
             log(LogLevel.Step, "1/5 扫描源目录…");
             ScanResult scan = FileCopier.Scan(source, cancelled);
+
+            // 读不到的目录必须当场中止：此时还没写目标、也没动源目录，风险为零
+            FileCopier.ThrowIfScanFailed(scan, "源目录");
+
             log(LogLevel.Info, $"  文件 {Fmt.Count(scan.FileCount)}，目录 {Fmt.Count(scan.DirCount)}，" +
                                $"总大小 {Fmt.Bytes(scan.TotalBytes)}，跳过重解析点 {scan.SkippedReparse} 个");
+
+            if (scan.SkippedReparse > 0)
+            {
+                log(LogLevel.Warn, $"  注意：源目录内有 {scan.SkippedReparse} 个目录联接/符号链接，已按设计跳过不复制（避免重复与自引用）。");
+                foreach (string rp in scan.ReparsePaths.Take(5)) log(LogLevel.Warn, "    · " + rp);
+                if (scan.ReparsePaths.Count > 5)
+                    log(LogLevel.Warn, "    · …… 其余 " + (scan.ReparsePaths.Count - 5) + " 个省略");
+                log(LogLevel.Warn, "    迁移后这些位置在新目录里不存在，它们原本指向的数据仍留在原处。");
+            }
 
             // 2) 复制
             log(LogLevel.Step, "2/5 复制到目标位置（长路径安全，跳过重解析点）…");
@@ -625,7 +678,16 @@ namespace WorkBuddyDataMover.Core
                 }
 
                 ScanResult scan = FileCopier.Scan(srcSub, cancelled);
+                FileCopier.ThrowIfScanFailed(scan, name + " 目录");
                 log(LogLevel.Info, $"  文件 {Fmt.Count(scan.FileCount)}，{Fmt.Bytes(scan.TotalBytes)}");
+
+                if (scan.SkippedReparse > 0)
+                {
+                    log(LogLevel.Warn, $"  {name} 内有 {scan.SkippedReparse} 个联接/符号链接被跳过（不复制）：");
+                    foreach (string rp in scan.ReparsePaths.Take(5)) log(LogLevel.Warn, "    · " + rp);
+                    if (scan.ReparsePaths.Count > 5)
+                        log(LogLevel.Warn, "    · …… 其余 " + (scan.ReparsePaths.Count - 5) + " 个省略");
+                }
 
                 log(LogLevel.Step, $"[{index}/{total}] {name}：复制…");
                 FileCopier.Copy(srcSub, tgtSub, scan, opt.MergeMode,
@@ -721,32 +783,51 @@ namespace WorkBuddyDataMover.Core
                 }
             }
 
+            var failed = new List<string>();
+
             if (string.Equals(record.Mode, "partial", StringComparison.OrdinalIgnoreCase))
             {
                 foreach (PartialItemRecord it in Enumerable.Reverse(record.Items ?? new List<PartialItemRecord>()))
                 {
-                    RollbackOne(it.JunctionPath, it.BackupPath, log);
+                    if (!RollbackOne(it.JunctionPath, it.BackupPath, log)) failed.Add(it.JunctionPath);
                 }
             }
             else
             {
-                RollbackOne(record.SourcePath, record.BackupPath, log);
+                if (!RollbackOne(record.SourcePath, record.BackupPath, log)) failed.Add(record.SourcePath);
 
                 if (string.Equals(record.Mode, "env", StringComparison.OrdinalIgnoreCase))
                 {
-                    string name = string.IsNullOrEmpty(record.EnvName) ? WorkBuddyPaths.EnvPrimary : record.EnvName;
-                    if (record.EnvOriginalExisted && !string.IsNullOrWhiteSpace(record.EnvOriginalValue))
+                    if (failed.Count > 0)
                     {
-                        SetUserEnv(name, record.EnvOriginalValue);
-                        log(LogLevel.Ok, $"  环境变量已还原：{name} = {record.EnvOriginalValue}");
+                        // 目录没还原成功时不动环境变量：它仍指向数据实际所在的位置，比改回去更安全
+                        log(LogLevel.Warn, "  目录未还原，环境变量保持现状（仍指向目标目录）。");
                     }
                     else
                     {
-                        SetUserEnv(name, null);
-                        log(LogLevel.Ok, $"  环境变量已清空：{name}（迁移前未设置）");
+                        string name = string.IsNullOrEmpty(record.EnvName) ? WorkBuddyPaths.EnvPrimary : record.EnvName;
+                        if (record.EnvOriginalExisted && !string.IsNullOrWhiteSpace(record.EnvOriginalValue))
+                        {
+                            SetUserEnv(name, record.EnvOriginalValue);
+                            log(LogLevel.Ok, $"  环境变量已还原：{name} = {record.EnvOriginalValue}");
+                        }
+                        else
+                        {
+                            SetUserEnv(name, null);
+                            log(LogLevel.Ok, $"  环境变量已清空：{name}（迁移前未设置）");
+                        }
+                        BroadcastSettingChange();
                     }
-                    BroadcastSettingChange();
                 }
+            }
+
+            // 没还原干净就不能标记 rolledback —— 否则记录作废，备份再也没法通过工具恢复
+            if (failed.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    "回滚未能完全还原：" + string.Join("、", failed) +
+                    "。这些位置已被其它内容占用，或备份目录缺失，工具不会覆盖或删除它们。" +
+                    "处理完占用后可再次执行回滚；迁移记录保持为可用状态。");
             }
 
             record.Status = "rolledback";
@@ -760,10 +841,11 @@ namespace WorkBuddyDataMover.Core
             log(LogLevel.Ok, "=== 回滚完成 ===");
         }
 
-        private static void RollbackOne(string originalPath, string backupPath, Action<LogLevel, string> log)
+        /// <summary>还原一个位置。返回 false 表示没能还原（调用方不得把记录标成已回滚）。</summary>
+        private static bool RollbackOne(string originalPath, string backupPath, Action<LogLevel, string> log)
         {
             if (string.IsNullOrEmpty(originalPath))
-                return;
+                return true;
 
             // 1) 移除联接（仅当它确实是联接）
             if (Junction.IsJunction(originalPath))
@@ -773,26 +855,45 @@ namespace WorkBuddyDataMover.Core
             }
             else if (LongPath.IsDirectory(originalPath) && HasAnyEntry(originalPath))
             {
-                log(LogLevel.Warn, $"  {originalPath} 已是含数据的实体目录，跳过不加处理（避免误删）。");
-                return;
+                log(LogLevel.Error,
+                    $"  {originalPath} 已是含数据的实体目录，为避免误删已跳过。请先把它移走或改名，再重试回滚。");
+                return false;
             }
+            else if (LongPath.Exists(originalPath))
+            {
+                // 空目录（例如迁移后 WorkBuddy 用旧环境变量又建出来的空壳）会挡住改名，直接清掉
+                try
+                {
+                    Directory.Delete(LongPath.Fix(originalPath));
+                    log(LogLevel.Info, "  已清掉空目录：" + originalPath);
+                }
+                catch (Exception ex)
+                {
+                    log(LogLevel.Error, $"  空目录无法删除：{originalPath} —— {ex.Message}");
+                    return false;
+                }
+            }
+
+            if (string.IsNullOrEmpty(backupPath))
+                return true;
 
             // 2) 把备份改回原名
-            if (!string.IsNullOrEmpty(backupPath) && LongPath.Exists(backupPath))
+            if (!LongPath.Exists(backupPath))
             {
-                if (LongPath.Exists(originalPath))
-                {
-                    log(LogLevel.Warn, "  原名位置仍被占用，无法改回：" + originalPath);
-                    return;
-                }
+                log(LogLevel.Error, "  备份目录不存在，无法还原：" + backupPath +
+                    "（可能已被「清理备份」删除，请从回收站或其它备份恢复）");
+                return false;
+            }
 
-                MoveDirectory(backupPath, originalPath);
-                log(LogLevel.Ok, "  已改回原名：" + backupPath + " → " + originalPath);
-            }
-            else if (!string.IsNullOrEmpty(backupPath))
+            if (LongPath.Exists(originalPath))
             {
-                log(LogLevel.Warn, "  备份目录不存在，可能已被清理：" + backupPath);
+                log(LogLevel.Error, "  原名位置仍被占用，无法改回：" + originalPath);
+                return false;
             }
+
+            MoveDirectory(backupPath, originalPath);
+            log(LogLevel.Ok, "  已改回原名：" + backupPath + " → " + originalPath);
+            return true;
         }
 
         // ---------------- 清理备份 ----------------

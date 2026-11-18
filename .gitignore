@@ -4,6 +4,7 @@ obj/
 publish/
 dist/
 dist-sc/
+dist-standalone/
 
 # 图标生成脚本的中间产物
 app-preview.png
