@@ -1487,9 +1487,27 @@ namespace WorkBuddyDataMover
             _lastArchiveDir = Path.GetDirectoryName(archivePath) ?? _lastArchiveDir;
 
             // 目标盘空间粗算：压缩后按源的 70% 估计
-            long srcBytes = 0;
-            foreach (string b in backups)
-                srcBytes += ProcessGuard.MeasureDirectory(b).Bytes;
+            // 十几万文件统计要十几秒，必须在后台跑，否则界面假死
+            SetBusy(true, cancelable: false);
+            _bar.Style = ProgressBarStyle.Marquee;
+            _lblProgress.Text = "正在统计备份体积…";
+
+            long srcBytes;
+            try
+            {
+                srcBytes = await Task.Run(() =>
+                {
+                    long total = 0;
+                    foreach (string b in backups) total += ProcessGuard.MeasureDirectory(b).Bytes;
+                    return total;
+                });
+            }
+            finally
+            {
+                _bar.Style = ProgressBarStyle.Continuous;
+                _bar.Value = 0;
+                SetBusy(false);
+            }
 
             var sb = new System.Text.StringBuilder();
             sb.AppendLine("即将把备份目录压缩归档：");
