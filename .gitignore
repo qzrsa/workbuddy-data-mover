@@ -1,0 +1,22 @@
+# 构建产物
+bin/
+obj/
+publish/
+dist/
+dist-sc/
+
+# 图标生成脚本的中间产物
+app-preview.png
+app-sheet.png
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.cache
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store

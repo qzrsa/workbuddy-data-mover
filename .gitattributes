@@ -1,0 +1,6 @@
+# 统一换行：Windows 项目，检出为 CRLF，仓库内存 LF
+* text=auto eol=crlf
+
+*.ico binary
+*.png binary
+*.exe binary
